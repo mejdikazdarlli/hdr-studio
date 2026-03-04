@@ -564,7 +564,7 @@ const handleGenerateHDR = async () => {
                       ref={fileInputRef}
                       type="file" 
                       multiple 
-                      accept=".jpg,.jpeg,.png,.dng,.cr2,.nef,.arw,.raf,.rw2,image/*"
+                      accept=".jpg,.jpeg,.png,.dng,.cr2,.cr3,.nef,.arw,.raf,.rw2,image/*"
                       className="hidden" 
                       onChange={handleFileSelect}
                     />
