@@ -1,15 +1,12 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useRef } from 'react';
 import { 
   FolderPlus, 
   Trash2, 
   Upload, 
   Image as ImageIcon, 
-  Cpu, 
   X, 
   CheckCircle2, 
   AlertCircle, 
-  Sun, 
-  Moon, 
   Download,
   Layers,
   Zap,
@@ -22,23 +19,6 @@ import { twMerge } from 'tailwind-merge';
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
-const RAW_EXTENSIONS = [
-  ".dng",
-  ".cr2",
-  ".cr3",
-  ".nef",
-  ".arw",
-  ".raf",
-  ".rw2",
-  ".orf",
-  ".srw",
-  ".pef"
-];
-
-const isRawFile = (filename: string) => {
-  const lower = filename.toLowerCase();
-  return RAW_EXTENSIONS.some(ext => lower.endsWith(ext));
-};
 
 // --- Types ---
 type ProjectType = 'Exterior' | 'Interior';
@@ -227,22 +207,6 @@ const uploadSingleImage = (
 
   xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
   xhr.send(formData);
-};
-const markImageError = (imageId: string, projectId: string) => {
-  setProjects(prev =>
-    prev.map(p =>
-      p.id === projectId
-        ? {
-            ...p,
-            images: p.images.map(img =>
-              img.id === imageId
-                ? { ...img, uploadStatus: "error" }
-                : img
-            )
-          }
-        : p
-    )
-  );
 };
 
 const handleRemoveImage = (imageId: string) => {
