@@ -367,7 +367,7 @@ const handleGenerateHDR = async () => {
               <Layers className="w-5 h-5 text-white" />
             </div>
             <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
-              Lumina HDR
+              Studio HDR
             </h1>
           </div>
           <p className="text-xs text-slate-500 ml-11">AI-Powered Imaging</p>
