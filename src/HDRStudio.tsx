@@ -1,12 +1,15 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   FolderPlus, 
   Trash2, 
   Upload, 
   Image as ImageIcon, 
+  Cpu, 
   X, 
   CheckCircle2, 
   AlertCircle, 
+  Sun, 
+  Moon, 
   Download,
   Layers,
   Zap,
@@ -14,11 +17,29 @@ import {
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import NgrokImage from "./components/NgrokImage";
 
 // --- Utility ---
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+const RAW_EXTENSIONS = [
+  ".dng",
+  ".cr2",
+  ".cr3",
+  ".nef",
+  ".arw",
+  ".raf",
+  ".rw2",
+  ".orf",
+  ".srw",
+  ".pef"
+];
+
+const isRawFile = (filename: string) => {
+  const lower = filename.toLowerCase();
+  return RAW_EXTENSIONS.some(ext => lower.endsWith(ext));
+};
 
 // --- Types ---
 type ProjectType = 'Exterior' | 'Interior';
@@ -208,6 +229,22 @@ const uploadSingleImage = (
   xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
   xhr.send(formData);
 };
+const markImageError = (imageId: string, projectId: string) => {
+  setProjects(prev =>
+    prev.map(p =>
+      p.id === projectId
+        ? {
+            ...p,
+            images: p.images.map(img =>
+              img.id === imageId
+                ? { ...img, uploadStatus: "error" }
+                : img
+            )
+          }
+        : p
+    )
+  );
+};
 
 const handleRemoveImage = (imageId: string) => {
   if (!activeProjectId) return;
@@ -367,7 +404,7 @@ const handleGenerateHDR = async () => {
               <Layers className="w-5 h-5 text-white" />
             </div>
             <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
-              Studio HDR
+              Lumina HDR
             </h1>
           </div>
           <p className="text-xs text-slate-500 ml-11">AI-Powered Imaging</p>
@@ -564,7 +601,7 @@ const handleGenerateHDR = async () => {
                       ref={fileInputRef}
                       type="file" 
                       multiple 
-                      accept=".jpg,.jpeg,.png,.dng,.cr2,.cr3,.nef,.arw,.raf,.rw2,image/*"
+                      accept=".jpg,.jpeg,.png,.dng,.cr2,.nef,.arw,.raf,.rw2,image/*"
                       className="hidden" 
                       onChange={handleFileSelect}
                     />
@@ -588,7 +625,7 @@ const handleGenerateHDR = async () => {
                     <div className="mt-6 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
                       {activeProject.images.map((img) => (
                         <div key={img.id} className="group relative aspect-square rounded-xl overflow-hidden bg-slate-900 border border-slate-800">
-                          <img
+                          <NgrokImage
                             src={img.previewUrl}
                             alt={img.name}
                             className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
