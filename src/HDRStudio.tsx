@@ -1,48 +1,25 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { 
-  FolderPlus, 
-  Trash2, 
-  Upload, 
-  Image as ImageIcon, 
-  Cpu, 
-  X, 
-  CheckCircle2, 
-  AlertCircle, 
-  Sun, 
-  Moon, 
-  Download,
+import {
+  FolderPlus,
+  Trash2,
+  Image as ImageIcon,
+  X,
+  CheckCircle2,
   Layers,
-  Zap,
   MoreVertical
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import NgrokImage from "./components/NgrokImage";
 
 // --- Utility ---
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
-const RAW_EXTENSIONS = [
-  ".dng",
-  ".cr2",
-  ".cr3",
-  ".nef",
-  ".arw",
-  ".raf",
-  ".rw2",
-  ".orf",
-  ".srw",
-  ".pef"
-];
 
-const isRawFile = (filename: string) => {
-  const lower = filename.toLowerCase();
-  return RAW_EXTENSIONS.some(ext => lower.endsWith(ext));
-};
+
 
 // --- Types ---
-type ProjectType = 'Exterior' | 'Interior';
+type ProjectType = 'Exterior' | 'Interior' | 'Mixed';
 
 interface RawImage {
   id: string;
@@ -58,7 +35,8 @@ interface RawImage {
 interface HDRResult {
   url: string;
   downloadUrl: string;
-  timestamp: number;
+  blendUrl?: string;
+  timestamp?: number;
 }
 
 interface Project {
@@ -67,9 +45,11 @@ interface Project {
   type: ProjectType;
   images: RawImage[];
   result: HDRResult | null;
-  status: 'idle' | 'processing' | 'completed' | 'error';
+  status: 'idle' | 'processing' | 'finalizing' | 'completed' | 'error';
   progress: number;
   logs: string[];
+  jobId?: string;
+  serverProjectId?: string;
 }
 
 // --- Components ---
@@ -80,26 +60,240 @@ export default function HDRStudio() {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const [existingJobId, setExistingJobId] = useState("");
+  const [loadingExisting, setLoadingExisting] = useState(false);
+  type ServerJob = {
+    status: "processing" | "completed" | "error";
+    progress: number;
+  };
+
+  const [serverJobs, setServerJobs] = useState<Record<string, ServerJob>>({});
+  const [jobStartTimes, setJobStartTimes] = useState<Record<string, number>>({});
 
   // Form State
   const [newProjectName, setNewProjectName] = useState('');
-  const [newProjectType, setNewProjectType] = useState<ProjectType>('Exterior');
+  const [newProjectType, setNewProjectType] = useState<ProjectType | ''>('');
 
   // --- Refs ---
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hdrPollRef = useRef<any>(null);
+  const existingPollRef = useRef<any>(null);
+  const resultCacheRef = useRef<Record<string, string>>({});
+  const blendCacheRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    return () => {
+      if (hdrPollRef.current) clearInterval(hdrPollRef.current);
+      if (existingPollRef.current) clearInterval(existingPollRef.current);
+    };
+  }, []);
+
+  const [serverStatus, setServerStatus] = useState<"online" | "offline">("offline");
+  const [retrying, setRetrying] = useState(false);
+
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
   // --- Derived State ---
+
   const activeProject = projects.find(p => p.id === activeProjectId);
+  useEffect(() => {
+    setImageLoaded(false);
+  }, [activeProjectId]); // 🔥 only when switching project
+
+
+  useEffect(() => {
+    if (!existingJobId) return;
+
+    handleLoadExistingJob();
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [existingJobId]);
+
+  useEffect(() => {
+    let interval: any;
+
+    const fetchJobs = async () => {
+      try {
+        const res = await fetch(`${API_URL}/jobs`, {
+          headers: { "ngrok-skip-browser-warning": "true" }
+        });
+
+        if (!res.ok) throw new Error();
+
+        const data = await res.json();
+
+        setServerJobs(data);
+        setServerStatus("online");
+        setLastUpdated(Date.now());
+
+        setJobStartTimes(prev => {
+          const updated = { ...prev };
+
+          Object.entries(data).forEach(([id, job]: any) => {
+            if (!updated[id] && job.status === "processing") {
+              updated[id] = Date.now();
+            }
+          });
+
+          return updated;
+        });
+
+      } catch {
+        setServerStatus("offline");
+        setServerJobs({});
+      }
+    };
+
+    // first call
+    fetchJobs();
+
+    // adaptive polling
+    interval = setInterval(() => {
+      fetchJobs();
+    }, serverStatus === "online" ? 2000 : 4000); // slower when offline
+
+    return () => clearInterval(interval);
+
+  }, [serverStatus]);
+
+  const handleRetryConnection = async () => {
+    setRetrying(true);
+
+    try {
+      const res = await fetch(`${API_URL}/jobs`, {
+        headers: { "ngrok-skip-browser-warning": "true" }
+      });
+
+      if (!res.ok) throw new Error();
+
+      const data = await res.json();
+
+      setServerJobs(data);
+      setServerStatus("online");
+
+    } catch {
+      setServerStatus("offline");
+    }
+
+    setRetrying(false);
+  };
+
+  const openJob = useCallback(async (jobId: string) => {
+
+    // get job info from server
+    const res = await fetch(`${API_URL}/jobs`, {
+      headers: { "ngrok-skip-browser-warning": "true" }
+    });
+
+    if (!res.ok) return;
+
+    const jobs = await res.json();
+    const job = jobs[jobId];
+
+    if (!job) return;
+
+    let serverProjectId = job.project_id;
+
+    // 🔥 FALLBACK: extract from result path
+    if (!serverProjectId && job.result) {
+      const match = job.result.match(/TEMP[\\/](.*?)[\\/]/);
+      if (match) {
+        serverProjectId = match[1];
+      }
+    }
+
+    if (!serverProjectId) {
+      console.error("Cannot resolve project_id");
+      return;
+    }
+
+    const newProjectId = crypto.randomUUID();
+
+    const newProject: Project = {
+      id: newProjectId,
+      name: `Job ${jobId.slice(0, 6)}`,
+      type: "Exterior",
+      images: [],
+      result: null,
+      status: job.status,
+      progress: job.progress,
+      logs: [],
+      jobId,
+      serverProjectId
+    };
+
+    setProjects(prev => [...prev, newProject]);
+    setActiveProjectId(newProjectId);
+
+    // ✅ NOW THIS WILL WORK
+    loadJobPreviews(serverProjectId, newProjectId);
+
+  }, []);
+
+  const openCompletedJob = async (jobId: string) => {
+
+    const res = await fetch(`${API_URL}/jobs`, {
+      headers: { "ngrok-skip-browser-warning": "true" }
+    });
+
+    if (!res.ok) return;
+
+    const jobs = await res.json();
+    const job = jobs[jobId];
+    if (!job) return;
+
+    let serverProjectId = job.project_id;
+
+    if (!serverProjectId && job.result) {
+      const match = job.result.match(/TEMP[\\/](.*?)[\\/]/);
+      if (match) serverProjectId = match[1];
+    }
+
+    if (!serverProjectId) return;
+
+    const newProjectId = crypto.randomUUID();
+
+    const previewUrl = `${API_URL}/result_preview/${jobId}`;
+    const blendUrl = `${API_URL}/blend_preview/${jobId}`;
+
+    const newProject: Project = {
+      id: newProjectId,
+      name: `Job ${jobId.slice(0, 6)}`,
+      type: "Exterior",
+      images: [],
+      status: "completed",
+      progress: 100,
+      logs: [],
+      jobId,
+      serverProjectId,
+
+      // 🔥 SHOW RESULT INSTANTLY
+      result: {
+        url: previewUrl,
+        downloadUrl: `${API_URL}/result/${jobId}`,
+        blendUrl,
+        timestamp: Date.now()
+      }
+    };
+
+    setProjects(prev => [...prev, newProject]);
+    setActiveProjectId(newProjectId);
+
+    loadJobPreviews(serverProjectId, newProjectId);
+
+    // 🔥 silently load full PNG
+    preloadResult(jobId);
+  };
 
   // --- Handlers: Project Management ---
   const handleCreateProject = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newProjectName.trim()) return;
+    if (!newProjectName.trim() || !newProjectType) return;
 
     const newProject: Project = {
       id: crypto.randomUUID(),
       name: newProjectName,
-      type: newProjectType,
+      type: newProjectType as ProjectType,
       images: [],
       result: null,
       status: 'idle',
@@ -118,9 +312,12 @@ export default function HDRStudio() {
     if (project) {
       // Cleanup memory
       project.images.forEach(img => URL.revokeObjectURL(img.previewUrl));
-      if (project.result) URL.revokeObjectURL(project.result.url);
+      if (project.result && project.jobId) {
+        delete resultCacheRef.current[project.jobId];
+        URL.revokeObjectURL(project.result.url);
+      }
     }
-    
+
     const updatedProjects = projects.filter(p => p.id !== id);
     setProjects(updatedProjects);
     if (activeProjectId === id) {
@@ -139,54 +336,86 @@ export default function HDRStudio() {
 
   const API_URL = "https://intracardiac-unquestioningly-luciana.ngrok-free.dev";
 
-const processFiles = async (files: File[]) => {
-  if (!activeProjectId) return;
+  const loadJobPreviews = async (serverProjectId: string, projectId: string) => {
+    try {
+      const res = await fetch(`${API_URL}/preview/${serverProjectId}/`, {
+        headers: { "ngrok-skip-browser-warning": "true" }
+      });
 
-  for (const file of files) {
-    const imageId = crypto.randomUUID();
-    const localPreview = URL.createObjectURL(file);
+      if (!res.ok) return;
 
-    const newImage: RawImage = {
-      id: imageId,
-      file,
-      previewUrl: localPreview,
-      name: file.name,
-      uploadProgress: 0,
-      uploadStatus: "uploading" // ALWAYS uploading
-    };
+      const files = await res.json();
 
-    setProjects(prev =>
-      prev.map(p =>
-        p.id === activeProjectId
-          ? { ...p, images: [...p.images, newImage] }
-          : p
-      )
-    );
+      setProjects(prev =>
+        prev.map(p =>
+          p.id === projectId
+            ? {
+              ...p,
+              images: files.map((name: string) => ({
+                id: crypto.randomUUID(),
+                previewUrl: `${API_URL}/preview/${serverProjectId}/${name}?t=${Date.now()}`,
+                name,
+                uploadProgress: 100,
+                uploadStatus: "uploaded"
+              }))
+            }
+            : p
+        )
+      );
 
-    // ALWAYS upload (RAW + JPG + PNG)
-    uploadSingleImage(file, imageId, activeProjectId);
-  }
-};
-const uploadSingleImage = (
-  file: File,
-  imageId: string,
-  projectId: string
-) => {
+    } catch (e) {
+      console.error("preview load failed");
+    }
+  };
 
-  const formData = new FormData();
-  formData.append("file", file);
+  const processFiles = async (files: File[]) => {
+    if (!activeProjectId) return;
 
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", `${API_URL}/upload/${projectId}`);
+    for (const file of files) {
+      const imageId = crypto.randomUUID();
+      const localPreview = URL.createObjectURL(file);
 
-  xhr.upload.onprogress = (e) => {
-    if (!e.lengthComputable) return;
-    const percent = Math.round((e.loaded / e.total) * 100);
+      const newImage: RawImage = {
+        id: imageId,
+        file,
+        previewUrl: localPreview,
+        name: file.name,
+        uploadProgress: 0,
+        uploadStatus: "uploading" // ALWAYS uploading
+      };
 
-    setProjects(prev =>
-      prev.map(p =>
-        p.id === projectId
-          ? {
+      setProjects(prev =>
+        prev.map(p =>
+          p.id === activeProjectId
+            ? { ...p, images: [...p.images, newImage] }
+            : p
+        )
+      );
+
+      // ALWAYS upload (RAW + JPG + PNG)
+      uploadSingleImage(file, imageId, activeProjectId);
+    }
+  };
+  const uploadSingleImage = (
+    file: File,
+    imageId: string,
+    projectId: string
+  ) => {
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_URL}/upload/${projectId}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const percent = Math.round((e.loaded / e.total) * 100);
+
+      setProjects(prev =>
+        prev.map(p =>
+          p.id === projectId
+            ? {
               ...p,
               images: p.images.map(img =>
                 img.id === imageId
@@ -194,79 +423,64 @@ const uploadSingleImage = (
                   : img
               )
             }
-          : p
-      )
-    );
-  };
+            : p
+        )
+      );
+    };
 
-  xhr.onload = () => {
-    if (xhr.status !== 200) return;
+    xhr.onload = () => {
+      if (xhr.status !== 200) return;
 
-    const res = JSON.parse(xhr.responseText);
+      const res = JSON.parse(xhr.responseText);
 
-    setProjects(prev =>
-      prev.map(p =>
-        p.id === projectId
-          ? {
+      setProjects(prev =>
+        prev.map(p =>
+          p.id === projectId
+            ? {
               ...p,
               images: p.images.map(img =>
                 img.id === imageId
                   ? {
-                      ...img,
-                      previewUrl: `${API_URL}${res.preview_url}`,
-                      storedName: res.stored_name,
-                      uploadProgress: 100,
-                      uploadStatus: "uploaded"
-                    }
+                    ...img,
+                    previewUrl: `${API_URL}${res.preview_url}`,
+                    storedName: res.stored_name,
+                    uploadProgress: 100,
+                    uploadStatus: "uploaded"
+                  }
                   : img
               )
             }
-          : p
-      )
-    );
+            : p
+        )
+      );
+    };
+
+    xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
+    xhr.send(formData);
   };
 
-  xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
-  xhr.send(formData);
-};
-const markImageError = (imageId: string, projectId: string) => {
-  setProjects(prev =>
-    prev.map(p =>
-      p.id === projectId
-        ? {
-            ...p,
-            images: p.images.map(img =>
-              img.id === imageId
-                ? { ...img, uploadStatus: "error" }
-                : img
-            )
-          }
-        : p
-    )
-  );
-};
 
-const handleRemoveImage = (imageId: string) => {
-  if (!activeProjectId) return;
+  const handleRemoveImage = (imageId: string) => {
+    if (!activeProjectId) return;
 
-  setProjects(prev =>
-    prev.map(p => {
-      if (p.id !== activeProjectId) return p;
+    setProjects(prev =>
+      prev.map(p => {
+        if (p.id !== activeProjectId) return p;
 
-      const imageToRemove = p.images.find(img => img.id === imageId);
+        const imageToRemove = p.images.find(img => img.id === imageId);
 
-      // Clean up blob preview URLs only
-      if (imageToRemove && imageToRemove.previewUrl.startsWith("blob:")) {
-        URL.revokeObjectURL(imageToRemove.previewUrl);
-      }
+        // Clean up blob preview URLs only
+        if (imageToRemove && imageToRemove.previewUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(imageToRemove.previewUrl);
+        }
 
-      return {
-        ...p,
-        images: p.images.filter(img => img.id !== imageId)
-      };
-    })
-  );
-};
+        return {
+          ...p,
+          images: p.images.filter(img => img.id !== imageId)
+        };
+      })
+    );
+  };
 
   // --- Drag & Drop Handlers ---
   const handleDrag = (e: React.DragEvent) => {
@@ -289,100 +503,288 @@ const handleRemoveImage = (imageId: string) => {
   };
 
   // --- AI Processing Simulation ---
+  const handleGenerateHDR = async () => {
+    const projectId = activeProjectId;
+    const project = projects.find(p => p.id === projectId);
 
-const handleGenerateHDR = async () => {
-  if (!activeProjectId) return;
+    if (!projectId || !project || !project.type) return;
 
-  setProjects(prev =>
-    prev.map(p =>
-      p.id === activeProjectId
-        ? { ...p, status: "processing", progress: 0 }
-        : p
-    )
-  );
+    setImageLoaded(false);
 
-  const res = await fetch(`${API_URL}/process/${activeProjectId}`, {
-  method: "POST",
-      headers: {
-        "ngrok-skip-browser-warning": "true"
-      }
-    });
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("Process error response:", text);
-    return;
-  }
-
-  const contentType = res.headers.get("content-type");
-
-  if (!contentType?.includes("application/json")) {
-    const text = await res.text();
-    console.error("Not JSON response:", text);
-    return;
-  }
-
-  const { job_id } = await res.json();
-
-  const poll = setInterval(async () => {
-    const statusRes = await fetch(`${API_URL}/status/${job_id}`, {
-      headers: {
-        "ngrok-skip-browser-warning": "true"
-      }
-    });
-
-    if (!statusRes.ok) {
-      const text = await statusRes.text();
-      console.error("Status error:", text);
-      return;
+    // 🔥 cancel previous poll safely
+    if (hdrPollRef.current) {
+      clearInterval(hdrPollRef.current);
+      hdrPollRef.current = null;
     }
 
-    const data = await statusRes.json();
-
+    // --------------------------------------------------
+    // ✅ set processing state
+    // --------------------------------------------------
     setProjects(prev =>
       prev.map(p =>
-        p.id === activeProjectId
-          ? { ...p, progress: data.progress }
+        p.id === projectId
+          ? {
+            ...p,
+            status: "processing",
+            progress: 0,
+            result: null // 🔥 CLEAR OLD RESULT
+          }
           : p
       )
     );
 
-    if (data.status === "completed") {
-      clearInterval(poll);
-
-      const resultRes = await fetch(`${API_URL}/result/${job_id}`, {
+    try {
+      // --------------------------------------------------
+      // ✅ API CALL (FIXED HEADERS)
+      // --------------------------------------------------
+      const res = await fetch(`${API_URL}/process/${projectId}`, {
+        method: "POST",
         headers: {
+          "Content-Type": "application/json", // 🔥 REQUIRED
           "ngrok-skip-browser-warning": "true"
-        }
+        },
+        body: JSON.stringify({
+          scene_type: project.type
+        })
       });
 
-      if (!resultRes.ok) {
-        const text = await resultRes.text();
-        console.error("Result error:", text);
-        return;
-      }
+      if (!res.ok) throw new Error("Process request failed");
 
-      const blob = await resultRes.blob();
-      const url = URL.createObjectURL(blob);
+      const { job_id } = await res.json();
+
+      // --------------------------------------------------
+      // ✅ attach job to project
+      // --------------------------------------------------
+      setProjects(prev =>
+        prev.map(p =>
+          p.id === projectId
+            ? { ...p, jobId: job_id, serverProjectId: projectId }
+            : p
+        )
+      );
+
+      // --------------------------------------------------
+      // 🔁 POLLING
+      // --------------------------------------------------
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${API_URL}/status/${job_id}`, {
+            headers: { "ngrok-skip-browser-warning": "true" }
+          });
+
+          if (!statusRes.ok) return;
+
+          const data = await statusRes.json();
+
+          // update progress
+          setProjects(prev =>
+            prev.map(p =>
+              p.id === projectId
+                ? { ...p, progress: data.progress }
+                : p
+            )
+          );
+
+          // --------------------------------------------------
+          // ✅ COMPLETED
+          // --------------------------------------------------
+          if (data.status === "completed") {
+
+            clearInterval(poll);
+            hdrPollRef.current = null;
+
+            // 🔥 immediately switch state
+            setProjects(prev =>
+              prev.map(p =>
+                p.id === projectId
+                  ? { ...p, status: "finalizing" }
+                  : p
+              )
+            );
+
+            // preload full result (async, no await)
+            preloadResult(job_id);
+            // 🔥 preload blend image
+            try {
+              const blendRes = await fetch(`${API_URL}/blend_preview/${job_id}`, {
+                headers: { "ngrok-skip-browser-warning": "true" }
+              });
+
+              if (blendRes.ok) {
+                const blob = await blendRes.blob();
+                const blendUrl = URL.createObjectURL(blob);
+                blendCacheRef.current[job_id] = blendUrl;
+              }
+            } catch (e) {
+              console.warn("Blend preload failed");
+            }
+
+            let url: string;
+
+            if (resultCacheRef.current[job_id]) {
+              url = resultCacheRef.current[job_id];
+            } else {
+              const resultRes = await fetch(`${API_URL}/result/${job_id}`, {
+                headers: { "ngrok-skip-browser-warning": "true" }
+              });
+
+              if (!resultRes.ok) throw new Error("Result fetch failed");
+
+              const blob = await resultRes.blob();
+              url = URL.createObjectURL(blob);
+              resultCacheRef.current[job_id] = url;
+            }
+
+            // ✅ final state
+            setProjects(prev =>
+              prev.map(p =>
+                p.id === projectId
+                  ? {
+                    ...p,
+                    status: "completed",
+                    result: {
+                      url,
+                      downloadUrl: url,
+                      blendUrl: blendCacheRef.current[job_id] || `${API_URL}/blend_preview/${job_id}`,
+                      timestamp: Date.now()
+                    }
+                  }
+                  : p
+              )
+            );
+          }
+
+          // --------------------------------------------------
+          // ❌ ERROR CASE (you didn't handle this)
+          // --------------------------------------------------
+          if (data.status === "error") {
+            clearInterval(poll);
+            hdrPollRef.current = null;
+
+            setProjects(prev =>
+              prev.map(p =>
+                p.id === projectId
+                  ? { ...p, status: "error" }
+                  : p
+              )
+            );
+          }
+
+        } catch (err) {
+          console.error("Polling error:", err);
+        }
+      }, 800);
+
+      hdrPollRef.current = poll;
+
+    } catch (err) {
+      console.error("HDR generation failed:", err);
 
       setProjects(prev =>
         prev.map(p =>
-          p.id === activeProjectId
-            ? {
+          p.id === projectId
+            ? { ...p, status: "error" }
+            : p
+        )
+      );
+    }
+  };
+  const handleLoadExistingJob = useCallback(async () => {
+    if (!existingJobId || !activeProjectId || loadingExisting) return;
+
+    const projectId = activeProjectId;
+
+    // cancel previous poll
+    if (existingPollRef.current) clearInterval(existingPollRef.current);
+
+    setLoadingExisting(true);
+
+    let attempts = 0;
+
+    const poll = setInterval(async () => {
+      attempts++;
+
+      if (attempts > 300) {
+        clearInterval(poll);
+        setLoadingExisting(false);
+        return;
+      }
+
+      const statusRes = await fetch(`${API_URL}/status/${existingJobId}`, {
+        headers: { "ngrok-skip-browser-warning": "true" }
+      });
+
+      if (!statusRes.ok) {
+        clearInterval(poll);
+        setLoadingExisting(false);
+        return;
+      }
+
+      const data = await statusRes.json();
+
+      setProjects(prev =>
+        prev.map(p =>
+          p.id === projectId
+            ? { ...p, status: data.status, progress: data.progress, jobId: existingJobId }
+            : p
+        )
+      );
+
+      if (data.status === "completed") {
+
+        preloadResult(existingJobId);
+
+        // 👇 ADD THIS BLOCK (YOU MISSED IT HERE)
+        setProjects(prev =>
+          prev.map(p =>
+            p.id === projectId
+              ? { ...p, status: "finalizing" }
+              : p
+          )
+        );
+
+        clearInterval(poll);
+
+        let url: string;
+
+        if (resultCacheRef.current[existingJobId]) {
+          url = resultCacheRef.current[existingJobId];
+        } else {
+          const resultRes = await fetch(`${API_URL}/result/${existingJobId}`, {
+            headers: { "ngrok-skip-browser-warning": "true" }
+          });
+
+          if (!resultRes.ok) return;
+
+          const blob = await resultRes.blob();
+          url = URL.createObjectURL(blob);
+          resultCacheRef.current[existingJobId] = url;
+        }
+
+        setProjects(prev =>
+          prev.map(p =>
+            p.id === projectId
+              ? {
                 ...p,
                 status: "completed",
                 result: {
                   url,
                   downloadUrl: url,
+                  blendUrl: `${API_URL}/blend_preview/${existingJobId}`,
                   timestamp: Date.now()
                 }
               }
-            : p
-        )
-      );
-    }
-  }, 800);
-};
+              : p
+          )
+        );
+
+        setLoadingExisting(false);
+      }
+    }, 800);
+
+    existingPollRef.current = poll;
+  }, [existingJobId, activeProjectId, loadingExisting]);
+
   // --- Render Helpers ---
   const getStatusColor = (status: Project['status']) => {
     switch (status) {
@@ -393,9 +795,92 @@ const handleGenerateHDR = async () => {
     }
   };
 
+
+  useEffect(() => {
+    if (!activeProject) return;
+
+    if (activeProject.jobId && activeProject.status === "processing") {
+      setExistingJobId(activeProject.jobId);
+      handleLoadExistingJob();
+    }
+
+  }, [activeProject, handleLoadExistingJob]);
+
+
+  useEffect(() => {
+    const saved = localStorage.getItem("hdr_projects");
+    if (!saved) return;
+
+    const parsed = JSON.parse(saved);
+
+    // 🔥 ONLY restore projects WITHOUT jobId
+    setProjects(parsed.filter((p: any) => !p.jobId));
+  }, []);
+
+  useEffect(() => {
+    const clean = projects.filter(p => !p.jobId || serverJobs[p.jobId]);
+    localStorage.setItem("hdr_projects", JSON.stringify(clean));
+  }, [projects, serverJobs]);;
+
+  useEffect(() => {
+    if (serverStatus !== "online") return;
+
+    // 🔥 HARD SYNC: remove ghost projects
+    setProjects(prev => {
+      const cleaned = prev.filter(p => {
+        if (!p.jobId) return true; // keep manual projects
+        return serverJobs[p.jobId]; // keep only server jobs
+      });
+
+      return cleaned;
+    });
+
+  }, [serverJobs, serverStatus]);
+
+  const formatDuration = (start: number) => {
+    const s = Math.floor((Date.now() - start) / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+
+    return m > 0 ? `${m}m ${r}s` : `${r}s`;
+  };
+  const [imageLoaded, setImageLoaded] = useState(false);
+
+
+  const preloadResult = async (jobId: string) => {
+    try {
+
+      // already loaded
+      if (resultCacheRef.current[jobId]) return;
+
+      // STEP 1 → preview already shown
+
+      // STEP 2 → load full PNG
+      const res = await fetch(`${API_URL}/result/${jobId}`, {
+        headers: { "ngrok-skip-browser-warning": "true" }
+      });
+
+      if (!res.ok) return;
+
+      const blob = await res.blob();
+      const fullUrl = URL.createObjectURL(blob);
+
+      resultCacheRef.current[jobId] = fullUrl;
+
+      // replace preview with full
+      setProjects(prev =>
+        prev.map(p =>
+          p.jobId === jobId && p.result
+            ? { ...p, result: { ...p.result, url: fullUrl } }
+            : p
+        )
+      );
+
+    } catch { }
+  };
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-indigo-500/30 flex overflow-hidden">
-      
+
       {/* --- Sidebar --- */}
       <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col h-screen">
         <div className="p-6 border-b border-slate-800">
@@ -404,16 +889,136 @@ const handleGenerateHDR = async () => {
               <Layers className="w-5 h-5 text-white" />
             </div>
             <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
-              Lumina HDR
+              Ai HDR Studio
             </h1>
           </div>
           <p className="text-xs text-slate-500 ml-11">AI-Powered Imaging</p>
         </div>
 
+        <div className="flex items-center gap-2 ml-11 mt-1">
+          <div
+            className={`w-2 h-2 rounded-full ${serverStatus === "online"
+              ? "bg-emerald-400"
+              : "bg-rose-500 animate-pulse"
+              }`}
+          />
+          <span className="text-[10px] text-slate-500">
+            {serverStatus === "online" ? "Server Online" : "Server Offline"}
+          </span>
+
+          {serverStatus === "offline" && (
+            <button
+              onClick={handleRetryConnection}
+              disabled={retrying}
+              className="ml-2 text-[10px] px-2 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-300"
+            >
+              {retrying ? "..." : "Retry"}
+            </button>
+          )}
+        </div>
+
         <div className="flex-1 overflow-y-auto p-4 space-y-2">
+          {/* Jobs Panel */}
+          <div className="mb-6 px-2">
+            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+              Jobs Queue
+            </h2>
+
+            {lastUpdated && (
+              <div className="text-[10px] text-slate-500 mb-2">
+                Updated {Math.floor((Date.now() - lastUpdated) / 1000)}s ago
+              </div>
+            )}
+
+            {/* Manual Load */}
+            <div className="flex gap-2 mb-3">
+              <input
+                type="text"
+                placeholder="Paste job ID..."
+                value={existingJobId}
+                onChange={(e) => setExistingJobId(e.target.value)}
+                className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-white"
+              />
+              <button
+                onClick={() => openJob(existingJobId)}
+                disabled={!existingJobId}
+                className="px-2 py-1 bg-indigo-600 text-xs rounded"
+              >
+                Load
+              </button>
+            </div>
+
+            {/* Job List */}
+            <div className="space-y-2 max-h-56 overflow-y-auto">
+
+              {serverStatus === "offline" ? (
+
+                <div className="text-xs text-slate-500 text-center py-4">
+                  Server unreachable
+                </div>
+
+              ) : Object.keys(serverJobs).length === 0 ? (
+
+                <div className="text-xs text-slate-500 text-center py-4">
+                  No jobs yet
+                </div>
+
+              ) : (
+
+                Object.entries(serverJobs)
+                  .sort((a, b) => b[1].progress - a[1].progress)
+                  .map(([jobId, job]) => (
+                    <div
+                      key={jobId}
+                      onClick={() => {
+                        if (job.status === "completed") {
+                          openCompletedJob(jobId);
+                        } else {
+                          openJob(jobId);
+                        }
+                      }}
+                      className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 cursor-pointer transition flex flex-col gap-1"
+                    >
+                      <div className="flex justify-between text-xs items-center">
+                        <span className="truncate font-mono">
+                          {jobId.slice(0, 10)}
+                        </span>
+
+                        <div className="flex items-center gap-2">
+                          {job.status === "processing" && jobStartTimes[jobId] && (
+                            <span className="text-[10px] text-slate-500">
+                              {formatDuration(jobStartTimes[jobId])}
+                            </span>
+                          )}
+
+                          <span className={
+                            job.status === "completed"
+                              ? "text-emerald-400"
+                              : job.status === "processing"
+                                ? "text-amber-400"
+                                : "text-rose-400"
+                          }>
+                            {job.status}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="h-1 bg-slate-700 rounded overflow-hidden">
+                        <div
+                          className="h-full bg-indigo-500 transition-all"
+                          style={{ width: `${job.progress}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))
+
+              )}
+
+            </div>
+          </div>
           <div className="flex items-center justify-between mb-4 px-2">
             <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Projects</h2>
-            <button 
+            <button
               onClick={() => setIsCreating(true)}
               className="p-1.5 hover:bg-slate-800 rounded-md text-slate-400 hover:text-white transition-colors"
               title="New Project"
@@ -425,7 +1030,7 @@ const handleGenerateHDR = async () => {
           {projects.length === 0 && !isCreating && (
             <div className="text-center py-10 px-4 border-2 border-dashed border-slate-800 rounded-xl">
               <p className="text-slate-500 text-sm">No projects yet.</p>
-              <button 
+              <button
                 onClick={() => setIsCreating(true)}
                 className="mt-3 text-indigo-400 text-sm hover:text-indigo-300 font-medium"
               >
@@ -449,20 +1054,24 @@ const handleGenerateHDR = async () => {
                 onChange={(e) => setNewProjectType(e.target.value as ProjectType)}
                 className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 mb-3"
               >
+                <option value="" disabled>
+                  Select Scene Type
+                </option>
                 <option value="Exterior">Exterior</option>
                 <option value="Interior">Interior</option>
+                <option value="Mixed">Mixed</option>
               </select>
               <div className="flex gap-2">
-                <button 
-                  type="button" 
+                <button
+                  type="button"
                   onClick={() => setIsCreating(false)}
                   className="flex-1 px-3 py-1.5 text-xs font-medium text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors"
                 >
                   Cancel
                 </button>
-                <button 
+                <button
                   type="submit"
-                  disabled={!newProjectName.trim()}
+                  disabled={!newProjectName.trim() || !newProjectType}
                   className="flex-1 px-3 py-1.5 text-xs font-medium bg-indigo-600 hover:bg-indigo-500 text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Create
@@ -472,12 +1081,12 @@ const handleGenerateHDR = async () => {
           )}
 
           {projects.map(project => (
-            <div 
+            <div
               key={project.id}
               onClick={() => setActiveProjectId(project.id)}
               className={cn(
                 "group relative p-3 rounded-xl cursor-pointer transition-all duration-200 border",
-                activeProjectId === project.id 
+                activeProjectId === project.id
                   ? "bg-slate-800 border-indigo-500/50 shadow-lg shadow-indigo-500/10"
                   : "bg-transparent border-transparent hover:bg-slate-800/50 hover:border-slate-700"
               )}
@@ -506,7 +1115,7 @@ const handleGenerateHDR = async () => {
                   </div>
                 )}
               </div>
-              
+
               {/* Delete Button (Hover) */}
               <button
                 onClick={(e) => {
@@ -554,114 +1163,90 @@ const handleGenerateHDR = async () => {
               <div>
                 <h2 className="text-lg font-semibold text-white flex items-center gap-2">
                   {activeProject.name}
-                  <span className="text-xs font-normal px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
                     {activeProject.type}
                   </span>
                 </h2>
               </div>
-              <div className="flex items-center gap-4">
-                <div className="text-xs text-slate-500 flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                  System Ready
-                </div>
+              <div className="text-xs text-slate-500 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                System Ready
               </div>
             </header>
 
-            {/* Content Area */}
-            <div className="flex-1 overflow-y-auto p-8">
-              <div className="max-w-5xl mx-auto space-y-8">
-                
-                {/* Upload Section */}
+            {/* 🔥 MAIN SPLIT LAYOUT */}
+            <div className="flex-1 flex overflow-hidden px-6 py-4 gap-6">
+
+              {/* ================= LEFT SIDE ================= */}
+              <div className="w-[45%] overflow-y-auto pr-4 space-y-6">
+
+                {/* Upload */}
                 <section>
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                  <div className="flex justify-between mb-3">
+                    <h3 className="text-sm font-semibold text-slate-300 uppercase flex items-center gap-2">
                       <ImageIcon className="w-4 h-4" />
                       Source Images
                     </h3>
                     <span className="text-xs text-slate-500">
-                      {activeProject.images.length} files selected
+                      {activeProject.images.length} files
                     </span>
                   </div>
 
                   {/* Dropzone */}
-                  <div 
+                  <div
                     onDragEnter={handleDrag}
                     onDragLeave={handleDrag}
                     onDragOver={handleDrag}
                     onDrop={handleDrop}
                     onClick={() => fileInputRef.current?.click()}
                     className={cn(
-                      "relative border-2 border-dashed rounded-2xl p-10 transition-all duration-200 cursor-pointer group",
-                      dragActive 
+                      "border-2 border-dashed rounded-xl p-8 cursor-pointer text-center",
+                      dragActive
                         ? "border-indigo-500 bg-indigo-500/5"
-                        : "border-slate-700 bg-slate-900/30 hover:border-slate-600 hover:bg-slate-800/30"
+                        : "border-slate-700 hover:border-slate-600"
                     )}
                   >
-                    <input 
+                    <input
                       ref={fileInputRef}
-                      type="file" 
-                      multiple 
-                      accept=".jpg,.jpeg,.png,.dng,.cr2,.nef,.arw,.raf,.rw2,image/*"
-                      className="hidden" 
+                      type="file"
+                      multiple
+                      className="hidden"
                       onChange={handleFileSelect}
                     />
-                    <div className="flex flex-col items-center justify-center text-center space-y-3">
-                      <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center group-hover:scale-110 transition-transform duration-200">
-                        <Upload className={cn("w-6 h-6", dragActive ? "text-indigo-400" : "text-slate-500")} />
-                      </div>
-                      <div>
-                        <p className="text-sm font-medium text-slate-300">
-                          Click to upload or drag and drop
-                        </p>
-                        <p className="text-xs text-slate-500 mt-1">
-                          Supports RAW, JPG, PNG (Max 50MB each)
-                        </p>
-                      </div>
-                    </div>
+                    <p className="text-sm text-slate-400">
+                      Click or drag images here
+                    </p>
                   </div>
 
-                  {/* Image Grid */}
+                  {/* PREVIEW GRID */}
                   {activeProject.images.length > 0 && (
-                    <div className="mt-6 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-                      {activeProject.images.map((img) => (
-                        <div key={img.id} className="group relative aspect-square rounded-xl overflow-hidden bg-slate-900 border border-slate-800">
-                          <NgrokImage
+                    <div className="mt-4 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                      {activeProject.images.map(img => (
+                        <div
+                          key={img.id}
+                          className="relative aspect-square rounded-lg overflow-hidden bg-slate-800"
+                        >
+                          <img
                             src={img.previewUrl}
                             alt={img.name}
-                            className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
+                            className="w-full h-full object-cover transition-opacity duration-300"
+                            loading="lazy"
                           />
+
                           {img.uploadStatus === "uploading" && (
-                            <>
-                              <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center text-white text-xs">
-                                <span className="mb-1">Uploading</span>
-                                <span>{img.uploadProgress}%</span>
-                              </div>
-
-                              <div className="absolute bottom-0 left-0 right-0 h-1 bg-black/40">
-                                <div
-                                  className="h-full bg-blue-500 transition-all duration-200"
-                                  style={{ width: `${img.uploadProgress}%` }}
-                                />
-                              </div>
-                            </>
-                          )}
-
-                          {img.uploadStatus === "error" && (
-                            <div className="absolute inset-0 bg-rose-600/60 flex items-center justify-center text-white text-xs">
-                              Upload Failed
+                            <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center text-xs text-white">
+                              Uploading {img.uploadProgress}%
                             </div>
                           )}
-                          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3">
-                            <p className="text-xs text-white truncate font-medium">{img.name}</p>
-                          </div>
+
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
                               handleRemoveImage(img.id);
                             }}
-                            className="absolute top-2 right-2 p-1.5 bg-black/50 hover:bg-rose-500 text-white rounded-full opacity-0 group-hover:opacity-100 transition-all backdrop-blur-sm"
+                            className="absolute top-1 right-1 bg-black/50 p-1 rounded"
                           >
-                            <X className="w-3 h-3" />
+                            <X className="w-3 h-3 text-white" />
                           </button>
                         </div>
                       ))}
@@ -669,115 +1254,108 @@ const handleGenerateHDR = async () => {
                   )}
                 </section>
 
-                {/* Action Section */}
-                <section className="flex flex-col items-center py-8">
+                {/* Generate Button */}
+                <div className="flex justify-center pt-4">
                   <button
                     onClick={handleGenerateHDR}
-                    disabled={activeProject.images.length < 1 || activeProject.status === 'processing'}
-                    className={cn(
-                      "relative group overflow-hidden rounded-full px-8 py-4 font-bold text-lg shadow-2xl transition-all duration-300",
-                      activeProject.images.length < 1 
-                        ? "bg-slate-800 text-slate-500 cursor-not-allowed"
-                        : "bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:scale-105 hover:shadow-indigo-500/25"
-                    )}
+                    disabled={activeProject.images.length < 1 || activeProject.status === "processing"}
+                    className="px-8 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold"
                   >
-                    <div className="relative z-10 flex items-center gap-3">
-                      {activeProject.status === 'processing' ? (
-                        <>
-                          <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                          Processing...
-                        </>
-                      ) : (
-                        <>
-                          <Zap className="w-5 h-5 fill-current" />
-                          Generate HDR
-                        </>
-                      )}
-                    </div>
-                    {/* Button Glow Effect */}
-                    {activeProject.images.length >= 1 && activeProject.status !== 'processing' && (
-                      <div className="absolute inset-0 bg-gradient-to-r from-indigo-400 to-purple-400 opacity-0 group-hover:opacity-20 transition-opacity" />
-                    )}
+                    {activeProject.status === "processing"
+                      ? "Processing..."
+                      : activeProject.status === "finalizing"
+                        ? "Preparing..."
+                        : "Generate HDR"}
                   </button>
-                  {activeProject.images.length < 1 && (
-                    <p className="mt-3 text-xs text-slate-500 flex items-center gap-1">
-                      <AlertCircle className="w-3 h-3" />
-                      Select at least 1 image to merge
-                    </p>
-                  )}
-                </section>
+                </div>
 
-                {/* Processing Status / Logs */}
-                {activeProject.status === 'processing' && (
-                  <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6 space-y-4 animate-in fade-in slide-in-from-bottom-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm font-medium text-indigo-400">AI Processing Pipeline</span>
-                      <span className="text-sm font-mono text-slate-400">{activeProject.progress}%</span>
-                    </div>
-                    {/* Progress Bar */}
-                    <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-purple-500 transition-all duration-500 ease-out"
+                {/* Processing */}
+                {(activeProject.status === "processing" || activeProject.status === "finalizing") && (
+                  <div className="bg-slate-900 p-4 rounded-lg">
+                    <div className="text-xs mb-2">{activeProject.progress}%</div>
+                    <div className="h-2 bg-slate-800 rounded">
+                      <div
+                        className="h-full bg-indigo-500"
                         style={{ width: `${activeProject.progress}%` }}
                       />
                     </div>
-                    {/* Logs */}
-                    <div className="h-32 overflow-y-auto font-mono text-xs text-slate-400 space-y-1 bg-black/20 p-3 rounded-lg border border-slate-800/50">
-                      {activeProject.logs.map((log, i) => (
-                        <div key={i} className="flex gap-2">
-                          <span className="text-slate-600">[{new Date().toLocaleTimeString()}]</span>
-                          <span>{log}</span>
-                        </div>
-                      ))}
-                      <div className="animate-pulse">_</div>
-                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* ================= RIGHT SIDE (RESULT) ================= */}
+              <div className="w-[55%] min-w-[520px] overflow-hidden flex flex-col">
+
+                {/* ✅ WAITING STATE */}
+                {(activeProject.status === "processing" || activeProject.status === "finalizing") && (
+                  <div className="flex-1 flex flex-col items-center justify-center text-slate-500">
+                    <div className="w-16 h-16 border-4 border-slate-700 border-t-indigo-500 rounded-full animate-spin mb-4" />
+                    <p className="text-sm">
+                      {activeProject.status === "processing"
+                        ? "Processing HDR..."
+                        : "Preparing result..."}
+                    </p>
                   </div>
                 )}
 
-                {/* Results Section */}
-                {activeProject.status === 'completed' && activeProject.result && (
-                  <section className="animate-in fade-in zoom-in-95 duration-500">
-                    <div className="flex items-center justify-between mb-4">
-                      <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider flex items-center gap-2">
-                        <CheckCircle2 className="w-4 h-4" />
-                        Output Result
-                      </h3>
-                      <a 
-                        href={activeProject.result.downloadUrl}
-                        download={`${activeProject.name}_HDR.jpg`}
-                        className="text-xs flex items-center gap-1.5 text-slate-400 hover:text-white transition-colors"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        Download High-Res
-                      </a>
-                    </div>
-                    
-                    <div className="relative group rounded-2xl overflow-hidden border border-slate-800 bg-slate-900 shadow-2xl">
-                      <div className="absolute top-4 right-4 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button className="p-2 bg-black/50 backdrop-blur-md rounded-lg text-white hover:bg-black/70">
-                          <Download className="w-5 h-5" />
-                        </button>
-                      </div>
-                      <img 
-                        src={activeProject.result.url} 
-                        alt="HDR Result"
-                        className="w-full h-auto max-h-[600px] object-contain bg-[url('https://www.transparenttextures.com/patterns/dark-matter.png')]"
-                      />
-                      <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/90 to-transparent">
-                        <div className="flex items-center gap-3">
-                          <div className="px-2 py-1 bg-emerald-500/20 border border-emerald-500/30 rounded text-xs font-medium text-emerald-400">
-                            32-bit Float
-                          </div>
-                          <div className="px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-xs text-slate-300">
-                            Tone Mapped
-                          </div>
+                {/* ✅ RESULT */}
+                {activeProject.status === "completed" && activeProject.result && (
+                  <div className="space-y-4">
+                    <h3 className="text-sm text-emerald-400 font-semibold flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4" />
+                      Output Result
+                    </h3>
+
+                    <div className="grid grid-cols-2 gap-4">
+
+                      {/* 🔵 FINAL RESULT */}
+                      <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
+                        <div className="aspect-[4/3] flex items-center justify-center">
+                          <img
+                            src={activeProject.result.url}
+                            alt="Final"
+                            className="max-w-full max-h-full object-contain"
+                            loading="lazy"
+                          />
+                        </div>
+
+                        <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
+                          Final
                         </div>
                       </div>
+
+                      {/* 🔴 BLEND PREVIEW */}
+                      {activeProject.result.blendUrl && (
+                        <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
+                          <div className="aspect-[4/3] flex items-center justify-center">
+                            <img
+                              src={activeProject.result.blendUrl}
+                              alt="Blend"
+                              className="max-w-full max-h-full object-contain"
+                              loading="lazy"
+                            />
+                          </div>
+
+                          <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
+                            Blend
+                          </div>
+                        </div>
+                      )}
+
                     </div>
-                  </section>
+
+                    <a
+                      href={activeProject.result.downloadUrl}
+                      download
+                      className="block text-center text-sm text-indigo-400 hover:text-white"
+                    >
+                      Download High-Res
+                    </a>
+                  </div>
                 )}
 
               </div>
+
             </div>
           </>
         )}
