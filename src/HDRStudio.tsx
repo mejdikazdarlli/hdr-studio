@@ -10,6 +10,10 @@ import {
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { Project, ProjectType, RawImage } from "@/types";
+import { API_URL } from "./utils/api";
+import { useProjects } from "./hooks/useProjects";
+import { useHDR } from "./hooks/useHDR";
 
 // --- Utility ---
 function cn(...inputs: ClassValue[]) {
@@ -17,55 +21,28 @@ function cn(...inputs: ClassValue[]) {
 }
 
 
-
-// --- Types ---
-type ProjectType = 'Exterior' | 'Interior' | 'Mixed';
-
-interface RawImage {
-  id: string;
-  file?: File;          // only until upload
-  storedName?: string;  // server reference
-  fileId?: string;
-  previewUrl: string;        // what user sees
-  name: string;
-  uploadProgress: number;    // 0–100
-  uploadStatus: "idle" | "uploading" | "uploaded" | "error";
-}
-
-interface HDRResult {
-  url: string;
-  downloadUrl: string;
-  blendUrl?: string;
-  timestamp?: number;
-}
-
-interface Project {
-  id: string;
-  name: string;
-  type: ProjectType;
-  images: RawImage[];
-  result: HDRResult | null;
-  status: 'idle' | 'processing' | 'finalizing' | 'completed' | 'error';
-  progress: number;
-  logs: string[];
-  jobId?: string;
-  serverProjectId?: string;
-}
-
 // --- Components ---
 
 export default function HDRStudio() {
-  // --- State ---
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+
+  const {
+    projects,
+    setProjects,
+    activeProject,
+    activeProjectId,
+    setActiveProjectId,
+    createProject,
+    deleteProject
+  } = useProjects();
+  const { generateHDR } = useHDR(setProjects);
   const [isCreating, setIsCreating] = useState(false);
   const [dragActive, setDragActive] = useState(false);
-  const [existingJobId, setExistingJobId] = useState("");
-  const [loadingExisting, setLoadingExisting] = useState(false);
   type ServerJob = {
-    status: "processing" | "completed" | "error";
-    progress: number;
-  };
+  status: "processing" | "completed" | "error";
+  progress: number;
+  project_id?: string;
+  result?: string;
+};
 
   const [serverJobs, setServerJobs] = useState<Record<string, ServerJob>>({});
   const [jobStartTimes, setJobStartTimes] = useState<Record<string, number>>({});
@@ -76,38 +53,18 @@ export default function HDRStudio() {
 
   // --- Refs ---
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const hdrPollRef = useRef<any>(null);
-  const existingPollRef = useRef<any>(null);
-  const resultCacheRef = useRef<Record<string, string>>({});
-  const blendCacheRef = useRef<Record<string, string>>({});
+  const [existingJobId, setExistingJobId] = useState("");
 
-  useEffect(() => {
-    return () => {
-      if (hdrPollRef.current) clearInterval(hdrPollRef.current);
-      if (existingPollRef.current) clearInterval(existingPollRef.current);
-    };
-  }, []);
 
   const [serverStatus, setServerStatus] = useState<"online" | "offline">("offline");
   const [retrying, setRetrying] = useState(false);
 
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
-  // --- Derived State ---
-
-  const activeProject = projects.find(p => p.id === activeProjectId);
   useEffect(() => {
     setImageLoaded(false);
   }, [activeProjectId]); // 🔥 only when switching project
 
-
-  useEffect(() => {
-    if (!existingJobId) return;
-
-    handleLoadExistingJob();
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [existingJobId]);
 
   useEffect(() => {
     let interval: any;
@@ -138,10 +95,11 @@ export default function HDRStudio() {
           return updated;
         });
 
-      } catch {
-        setServerStatus("offline");
-        setServerJobs({});
-      }
+      } catch (e) {
+  console.error("Jobs fetch failed", e);
+  setServerStatus("offline");
+  setServerJobs({});
+}
     };
 
     // first call
@@ -171,172 +129,15 @@ export default function HDRStudio() {
       setServerJobs(data);
       setServerStatus("online");
 
-    } catch {
-      setServerStatus("offline");
-    }
+    } catch (e) {
+  console.error("Retry failed", e);
+  setServerStatus("offline");
+}
 
     setRetrying(false);
   };
 
-  const openJob = useCallback(async (jobId: string) => {
-
-    // get job info from server
-    const res = await fetch(`${API_URL}/jobs`, {
-      headers: { "ngrok-skip-browser-warning": "true" }
-    });
-
-    if (!res.ok) return;
-
-    const jobs = await res.json();
-    const job = jobs[jobId];
-
-    if (!job) return;
-
-    let serverProjectId = job.project_id;
-
-    // 🔥 FALLBACK: extract from result path
-    if (!serverProjectId && job.result) {
-      const match = job.result.match(/TEMP[\\/](.*?)[\\/]/);
-      if (match) {
-        serverProjectId = match[1];
-      }
-    }
-
-    if (!serverProjectId) {
-      console.error("Cannot resolve project_id");
-      return;
-    }
-
-    const newProjectId = crypto.randomUUID();
-
-    const newProject: Project = {
-      id: newProjectId,
-      name: `Job ${jobId.slice(0, 6)}`,
-      type: "Exterior",
-      images: [],
-      result: null,
-      status: job.status,
-      progress: job.progress,
-      logs: [],
-      jobId,
-      serverProjectId
-    };
-
-    setProjects(prev => [...prev, newProject]);
-    setActiveProjectId(newProjectId);
-
-    // ✅ NOW THIS WILL WORK
-    loadJobPreviews(serverProjectId, newProjectId);
-
-  }, []);
-
-  const openCompletedJob = async (jobId: string) => {
-
-    const res = await fetch(`${API_URL}/jobs`, {
-      headers: { "ngrok-skip-browser-warning": "true" }
-    });
-
-    if (!res.ok) return;
-
-    const jobs = await res.json();
-    const job = jobs[jobId];
-    if (!job) return;
-
-    let serverProjectId = job.project_id;
-
-    if (!serverProjectId && job.result) {
-      const match = job.result.match(/TEMP[\\/](.*?)[\\/]/);
-      if (match) serverProjectId = match[1];
-    }
-
-    if (!serverProjectId) return;
-
-    const newProjectId = crypto.randomUUID();
-
-    const previewUrl = `${API_URL}/result_preview/${jobId}`;
-    const blendUrl = `${API_URL}/blend_preview/${jobId}`;
-
-    const newProject: Project = {
-      id: newProjectId,
-      name: `Job ${jobId.slice(0, 6)}`,
-      type: "Exterior",
-      images: [],
-      status: "completed",
-      progress: 100,
-      logs: [],
-      jobId,
-      serverProjectId,
-
-      // 🔥 SHOW RESULT INSTANTLY
-      result: {
-        url: previewUrl,
-        downloadUrl: `${API_URL}/result/${jobId}`,
-        blendUrl,
-        timestamp: Date.now()
-      }
-    };
-
-    setProjects(prev => [...prev, newProject]);
-    setActiveProjectId(newProjectId);
-
-    loadJobPreviews(serverProjectId, newProjectId);
-
-    // 🔥 silently load full PNG
-    preloadResult(jobId);
-  };
-
-  // --- Handlers: Project Management ---
-  const handleCreateProject = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newProjectName.trim() || !newProjectType) return;
-
-    const newProject: Project = {
-      id: crypto.randomUUID(),
-      name: newProjectName,
-      type: newProjectType as ProjectType,
-      images: [],
-      result: null,
-      status: 'idle',
-      progress: 0,
-      logs: []
-    };
-
-    setProjects([...projects, newProject]);
-    setActiveProjectId(newProject.id);
-    setNewProjectName('');
-    setIsCreating(false);
-  };
-
-  const handleDeleteProject = (id: string) => {
-    const project = projects.find(p => p.id === id);
-    if (project) {
-      // Cleanup memory
-      project.images.forEach(img => URL.revokeObjectURL(img.previewUrl));
-      if (project.result && project.jobId) {
-        delete resultCacheRef.current[project.jobId];
-        URL.revokeObjectURL(project.result.url);
-      }
-    }
-
-    const updatedProjects = projects.filter(p => p.id !== id);
-    setProjects(updatedProjects);
-    if (activeProjectId === id) {
-      setActiveProjectId(updatedProjects.length > 0 ? updatedProjects[0].id : null);
-    }
-  };
-
-  // --- Handlers: Image Management ---
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && activeProjectId) {
-      processFiles(Array.from(e.target.files));
-    }
-    // Reset input
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const API_URL = "https://intracardiac-unquestioningly-luciana.ngrok-free.dev";
-
-  const loadJobPreviews = async (serverProjectId: string, projectId: string) => {
+    const loadJobPreviews = async (serverProjectId: string, projectId: string) => {
     try {
       const res = await fetch(`${API_URL}/preview/${serverProjectId}/`, {
         headers: { "ngrok-skip-browser-warning": "true" }
@@ -367,6 +168,181 @@ export default function HDRStudio() {
       console.error("preview load failed");
     }
   };
+
+const openJob = useCallback( (jobId: string) => {
+  if (!jobId) return;
+
+  // ✅ use already-fetched jobs (no extra API call)
+  const job = serverJobs[jobId];
+  if (!job) return;
+  const alreadyExists = projects.some(p => p.jobId === jobId);
+if (alreadyExists) {
+  const existing = projects.find(p => p.jobId === jobId);
+  if (existing) setActiveProjectId(existing.id);
+  return;
+}
+
+  let serverProjectId = job.project_id;
+
+  // 🔥 fallback extraction
+  if (!serverProjectId && (job as any).result) {
+    const match = (job as any).result.match(/TEMP[\\/](.*?)[\\/]/);
+    if (match) {
+      serverProjectId = match[1];
+    }
+  }
+
+  if (!serverProjectId) {
+    console.error("Cannot resolve project_id for job:", jobId);
+    return;
+  }
+
+  const newProjectId = crypto.randomUUID();
+
+  const newProject: Project = {
+    id: newProjectId,
+    name: `Job ${jobId.slice(0, 6)}`,
+    type: "Exterior",
+    images: [],
+    result: null,
+    status: job.status,
+    progress: job.progress,
+    logs: [],
+    jobId,
+    serverProjectId
+  };
+
+  // ✅ create project
+  setProjects(prev => [...prev, newProject]);
+  setActiveProjectId(newProjectId);
+
+  // ✅ load previews
+  loadJobPreviews(serverProjectId, newProjectId);
+
+  // ✅ attach HDR pipeline (resume job)
+  generateHDR(newProject, jobId);
+
+}, [serverJobs, setProjects, setActiveProjectId, generateHDR, loadJobPreviews]);
+
+const openCompletedJob = useCallback( (jobId: string) => {
+  if (!jobId) return;
+const alreadyExists = projects.some(p => p.jobId === jobId);
+if (alreadyExists) {
+  const existing = projects.find(p => p.jobId === jobId);
+  if (existing) setActiveProjectId(existing.id);
+  return;
+}
+  const job = serverJobs[jobId];
+  if (!job) return;
+
+  let serverProjectId = job.project_id;
+
+  // 🔥 fallback extraction
+  if (!serverProjectId && (job as any).result) {
+    const match = (job as any).result.match(/TEMP[\\/](.*?)[\\/]/);
+    if (match) {
+      serverProjectId = match[1];
+    }
+  }
+
+  if (!serverProjectId) {
+    console.error("Cannot resolve project_id for completed job:", jobId);
+    return;
+  }
+
+  const newProjectId = crypto.randomUUID();
+
+  const previewUrl = `${API_URL}/result_preview/${jobId}`;
+  const blendUrl = `${API_URL}/blend_preview/${jobId}`;
+
+  const newProject: Project = {
+    id: newProjectId,
+    name: `Job ${jobId.slice(0, 6)}`,
+    type: "Exterior",
+    images: [],
+    status: "completed",
+    progress: 100,
+    logs: [],
+    jobId,
+    serverProjectId,
+
+    // ✅ instant preview (fast UX)
+    result: {
+      url: previewUrl,
+      downloadUrl: `${API_URL}/result/${jobId}`,
+      blendUrl,
+      timestamp: Date.now()
+    }
+  };
+
+  // ✅ add project
+  setProjects(prev => [...prev, newProject]);
+  setActiveProjectId(newProjectId);
+
+  // ✅ load images
+  loadJobPreviews(serverProjectId, newProjectId);
+
+  // ✅ attach HDR system (keeps consistency)
+  generateHDR(newProject, jobId);
+
+  // ✅ silently upgrade preview → full image
+  preloadResult(jobId);
+
+}, [serverJobs, setProjects, setActiveProjectId, generateHDR, loadJobPreviews]);
+
+  // --- Handlers: Project Management ---
+  const handleCreateProject = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newProjectName.trim() || !newProjectType) return;
+
+    const newProject: Project = {
+      id: crypto.randomUUID(),
+      name: newProjectName,
+      type: newProjectType as ProjectType,
+      images: [],
+      result: null,
+      status: 'idle',
+      progress: 0,
+      logs: []
+    };
+
+    createProject(newProject);
+    setNewProjectName('');
+    setIsCreating(false);
+  };
+
+  const handleDeleteProject = (id: string) => {
+  const project = projects.find(p => p.id === id);
+
+  if (project) {
+    project.images.forEach(img => URL.revokeObjectURL(img.previewUrl));
+    if (project.result && project.jobId) {
+      URL.revokeObjectURL(project.result.url);
+    }
+  }
+
+  deleteProject(id);
+
+  setActiveProjectId(prev => {
+    if (prev !== id) return prev;
+
+    const remaining = projects.filter(p => p.id !== id);
+    return remaining.length > 0 ? remaining[0].id : null;
+  });
+};
+
+  // --- Handlers: Image Management ---
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && activeProjectId) {
+      processFiles(Array.from(e.target.files));
+    }
+    // Reset input
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // const API_URL = "https://intracardiac-unquestioningly-luciana.ngrok-free.dev";
+
+
 
   const processFiles = async (files: File[]) => {
     if (!activeProjectId) return;
@@ -502,288 +478,6 @@ export default function HDRStudio() {
     }
   };
 
-  // --- AI Processing Simulation ---
-  const handleGenerateHDR = async () => {
-    const projectId = activeProjectId;
-    const project = projects.find(p => p.id === projectId);
-
-    if (!projectId || !project || !project.type) return;
-
-    setImageLoaded(false);
-
-    // 🔥 cancel previous poll safely
-    if (hdrPollRef.current) {
-      clearInterval(hdrPollRef.current);
-      hdrPollRef.current = null;
-    }
-
-    // --------------------------------------------------
-    // ✅ set processing state
-    // --------------------------------------------------
-    setProjects(prev =>
-      prev.map(p =>
-        p.id === projectId
-          ? {
-            ...p,
-            status: "processing",
-            progress: 0,
-            result: null // 🔥 CLEAR OLD RESULT
-          }
-          : p
-      )
-    );
-
-    try {
-      // --------------------------------------------------
-      // ✅ API CALL (FIXED HEADERS)
-      // --------------------------------------------------
-      const res = await fetch(`${API_URL}/process/${projectId}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json", // 🔥 REQUIRED
-          "ngrok-skip-browser-warning": "true"
-        },
-        body: JSON.stringify({
-          scene_type: project.type
-        })
-      });
-
-      if (!res.ok) throw new Error("Process request failed");
-
-      const { job_id } = await res.json();
-
-      // --------------------------------------------------
-      // ✅ attach job to project
-      // --------------------------------------------------
-      setProjects(prev =>
-        prev.map(p =>
-          p.id === projectId
-            ? { ...p, jobId: job_id, serverProjectId: projectId }
-            : p
-        )
-      );
-
-      // --------------------------------------------------
-      // 🔁 POLLING
-      // --------------------------------------------------
-      const poll = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`${API_URL}/status/${job_id}`, {
-            headers: { "ngrok-skip-browser-warning": "true" }
-          });
-
-          if (!statusRes.ok) return;
-
-          const data = await statusRes.json();
-
-          // update progress
-          setProjects(prev =>
-            prev.map(p =>
-              p.id === projectId
-                ? { ...p, progress: data.progress }
-                : p
-            )
-          );
-
-          // --------------------------------------------------
-          // ✅ COMPLETED
-          // --------------------------------------------------
-          if (data.status === "completed") {
-
-            clearInterval(poll);
-            hdrPollRef.current = null;
-
-            // 🔥 immediately switch state
-            setProjects(prev =>
-              prev.map(p =>
-                p.id === projectId
-                  ? { ...p, status: "finalizing" }
-                  : p
-              )
-            );
-
-            // preload full result (async, no await)
-            preloadResult(job_id);
-            // 🔥 preload blend image
-            try {
-              const blendRes = await fetch(`${API_URL}/blend_preview/${job_id}`, {
-                headers: { "ngrok-skip-browser-warning": "true" }
-              });
-
-              if (blendRes.ok) {
-                const blob = await blendRes.blob();
-                const blendUrl = URL.createObjectURL(blob);
-                blendCacheRef.current[job_id] = blendUrl;
-              }
-            } catch (e) {
-              console.warn("Blend preload failed");
-            }
-
-            let url: string;
-
-            if (resultCacheRef.current[job_id]) {
-              url = resultCacheRef.current[job_id];
-            } else {
-              const resultRes = await fetch(`${API_URL}/result/${job_id}`, {
-                headers: { "ngrok-skip-browser-warning": "true" }
-              });
-
-              if (!resultRes.ok) throw new Error("Result fetch failed");
-
-              const blob = await resultRes.blob();
-              url = URL.createObjectURL(blob);
-              resultCacheRef.current[job_id] = url;
-            }
-
-            // ✅ final state
-            setProjects(prev =>
-              prev.map(p =>
-                p.id === projectId
-                  ? {
-                    ...p,
-                    status: "completed",
-                    result: {
-                      url,
-                      downloadUrl: url,
-                      blendUrl: blendCacheRef.current[job_id] || `${API_URL}/blend_preview/${job_id}`,
-                      timestamp: Date.now()
-                    }
-                  }
-                  : p
-              )
-            );
-          }
-
-          // --------------------------------------------------
-          // ❌ ERROR CASE (you didn't handle this)
-          // --------------------------------------------------
-          if (data.status === "error") {
-            clearInterval(poll);
-            hdrPollRef.current = null;
-
-            setProjects(prev =>
-              prev.map(p =>
-                p.id === projectId
-                  ? { ...p, status: "error" }
-                  : p
-              )
-            );
-          }
-
-        } catch (err) {
-          console.error("Polling error:", err);
-        }
-      }, 800);
-
-      hdrPollRef.current = poll;
-
-    } catch (err) {
-      console.error("HDR generation failed:", err);
-
-      setProjects(prev =>
-        prev.map(p =>
-          p.id === projectId
-            ? { ...p, status: "error" }
-            : p
-        )
-      );
-    }
-  };
-  const handleLoadExistingJob = useCallback(async () => {
-    if (!existingJobId || !activeProjectId || loadingExisting) return;
-
-    const projectId = activeProjectId;
-
-    // cancel previous poll
-    if (existingPollRef.current) clearInterval(existingPollRef.current);
-
-    setLoadingExisting(true);
-
-    let attempts = 0;
-
-    const poll = setInterval(async () => {
-      attempts++;
-
-      if (attempts > 300) {
-        clearInterval(poll);
-        setLoadingExisting(false);
-        return;
-      }
-
-      const statusRes = await fetch(`${API_URL}/status/${existingJobId}`, {
-        headers: { "ngrok-skip-browser-warning": "true" }
-      });
-
-      if (!statusRes.ok) {
-        clearInterval(poll);
-        setLoadingExisting(false);
-        return;
-      }
-
-      const data = await statusRes.json();
-
-      setProjects(prev =>
-        prev.map(p =>
-          p.id === projectId
-            ? { ...p, status: data.status, progress: data.progress, jobId: existingJobId }
-            : p
-        )
-      );
-
-      if (data.status === "completed") {
-
-        preloadResult(existingJobId);
-
-        // 👇 ADD THIS BLOCK (YOU MISSED IT HERE)
-        setProjects(prev =>
-          prev.map(p =>
-            p.id === projectId
-              ? { ...p, status: "finalizing" }
-              : p
-          )
-        );
-
-        clearInterval(poll);
-
-        let url: string;
-
-        if (resultCacheRef.current[existingJobId]) {
-          url = resultCacheRef.current[existingJobId];
-        } else {
-          const resultRes = await fetch(`${API_URL}/result/${existingJobId}`, {
-            headers: { "ngrok-skip-browser-warning": "true" }
-          });
-
-          if (!resultRes.ok) return;
-
-          const blob = await resultRes.blob();
-          url = URL.createObjectURL(blob);
-          resultCacheRef.current[existingJobId] = url;
-        }
-
-        setProjects(prev =>
-          prev.map(p =>
-            p.id === projectId
-              ? {
-                ...p,
-                status: "completed",
-                result: {
-                  url,
-                  downloadUrl: url,
-                  blendUrl: `${API_URL}/blend_preview/${existingJobId}`,
-                  timestamp: Date.now()
-                }
-              }
-              : p
-          )
-        );
-
-        setLoadingExisting(false);
-      }
-    }, 800);
-
-    existingPollRef.current = poll;
-  }, [existingJobId, activeProjectId, loadingExisting]);
 
   // --- Render Helpers ---
   const getStatusColor = (status: Project['status']) => {
@@ -796,15 +490,6 @@ export default function HDRStudio() {
   };
 
 
-  useEffect(() => {
-    if (!activeProject) return;
-
-    if (activeProject.jobId && activeProject.status === "processing") {
-      setExistingJobId(activeProject.jobId);
-      handleLoadExistingJob();
-    }
-
-  }, [activeProject, handleLoadExistingJob]);
 
 
   useEffect(() => {
@@ -850,8 +535,6 @@ export default function HDRStudio() {
   const preloadResult = async (jobId: string) => {
     try {
 
-      // already loaded
-      if (resultCacheRef.current[jobId]) return;
 
       // STEP 1 → preview already shown
 
@@ -865,8 +548,6 @@ export default function HDRStudio() {
       const blob = await res.blob();
       const fullUrl = URL.createObjectURL(blob);
 
-      resultCacheRef.current[jobId] = fullUrl;
-
       // replace preview with full
       setProjects(prev =>
         prev.map(p =>
@@ -876,7 +557,9 @@ export default function HDRStudio() {
         )
       );
 
-    } catch { }
+    } catch (e) {
+      console.error("preview load failed", e);
+    }
   };
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-indigo-500/30 flex overflow-hidden">
@@ -940,7 +623,10 @@ export default function HDRStudio() {
                 className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-white"
               />
               <button
-                onClick={() => openJob(existingJobId)}
+                onClick={() => {
+                  if (!existingJobId.trim()) return;
+                  openJob(existingJobId);
+                }}
                 disabled={!existingJobId}
                 className="px-2 py-1 bg-indigo-600 text-xs rounded"
               >
@@ -1257,7 +943,7 @@ export default function HDRStudio() {
                 {/* Generate Button */}
                 <div className="flex justify-center pt-4">
                   <button
-                    onClick={handleGenerateHDR}
+                    onClick={() => generateHDR(activeProject)}
                     disabled={activeProject.images.length < 1 || activeProject.status === "processing"}
                     className="px-8 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold"
                   >
