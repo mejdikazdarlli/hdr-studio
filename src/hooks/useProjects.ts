@@ -8,9 +8,16 @@ export function useProjects() {
   const activeProject = projects.find(p => p.id === activeProjectId);
 
   const createProject = (project: Project) => {
-    setProjects(prev => [...prev, project]);
+  setProjects(prev => {
+    const updated = [...prev, project];
+    return updated;
+  });
+
+  // 🔥 defer selection to next tick
+  setTimeout(() => {
     setActiveProjectId(project.id);
-  };
+  }, 0);
+};
 
   const deleteProject = (id: string) => {
     setProjects(prev => prev.filter(p => p.id !== id));

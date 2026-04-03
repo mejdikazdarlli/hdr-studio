@@ -4,32 +4,44 @@ import { Project } from "../types";
 import { Dispatch, SetStateAction } from "react";
 
 export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const resultCacheRef = useRef<Record<string, string>>({});
   const blendCacheRef = useRef<Record<string, string>>({});
 
   // 🔥 cleanup on unmount
   useEffect(() => {
     return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-      }
+      // 🔥 cleanup ALL active polls
+      Object.values(pollRef.current).forEach(clearInterval);
+      pollRef.current = {};
     };
   }, []);
 
   const generateHDR = async (
     project: Project | null,
-    existingJobId?: string
+    existingJobId?: string,
+    forceResize = false,
+    onError?: (err: any) => void
   ) => {
     if (!project || !project.type) return;
 
     const projectId = project.id;
+    const oldProject = project;
 
+    if (oldProject?.result?.url?.startsWith("blob:")) {
+      URL.revokeObjectURL(oldProject.result.url);
+    }
     // 🔥 reset state
     setProjects(prev =>
       prev.map(p =>
         p.id === projectId
-          ? { ...p, status: "processing", progress: 0, result: null }
+          ? {
+            ...p,
+            status: "processing",
+            progress: 0,
+            result: null,
+            jobId: undefined // 🔥 important: detach old job immediately
+          }
           : p
       )
     );
@@ -51,12 +63,23 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
             "Content-Type": "application/json",
             "ngrok-skip-browser-warning": "true"
           },
-          body: JSON.stringify({ scene_type: project.type })
+          body: JSON.stringify({
+            scene_type: project.type,
+            force_resize: forceResize
+          })
         });
 
         if (!res.ok) {
-          console.error("Process request failed");
-          throw new Error();
+          const error = await res.json();
+
+          if (error.detail?.includes("resolution")) {
+            throw {
+              type: "RESOLUTION_MISMATCH",
+              message: error.detail
+            };
+          }
+
+          throw new Error(error.detail || "Processing failed");
         }
 
         const data = await res.json();
@@ -86,9 +109,10 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
         )
       );
 
-      // 🔥 clear previous polling
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
+      // 🔥 stop only THIS project's poll
+      if (pollRef.current[projectId]) {
+        clearInterval(pollRef.current[projectId]);
+        delete pollRef.current[projectId];
       }
 
       // 🔥 clear cache for this job
@@ -121,7 +145,7 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
           // ✅ COMPLETED
           if (data.status === "completed") {
             clearInterval(poll);
-            pollRef.current = null;
+            delete pollRef.current[projectId];
 
             // set finalizing
             setProjects(prev =>
@@ -155,26 +179,35 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
 
             // set completed
             setProjects(prev =>
-              prev.map(p =>
-                p.id === projectId && p.jobId === safeJobId
-                  ? {
-                      ...p,
-                      status: "completed",
-                      result: {
-                        url,
-                        downloadUrl: url,
-                        blendUrl: `${API_URL}/blend_preview/${safeJobId}`,
-                        timestamp: Date.now()
-                      }
-                    }
-                  : p
-              )
+              prev.map(p => {
+                // 🔥 HARD GUARD: ignore stale async updates
+                if (p.id !== projectId || p.jobId !== safeJobId) return p;
+
+                return {
+                  ...p,
+                  status: "completed",
+                  result: {
+                    url,
+                    downloadUrl: url,
+                    blendUrl: `${API_URL}/blend_preview/${safeJobId}`,
+                    timestamp: Date.now()
+                  }
+                };
+              })
             );
           }
 
           // ❌ ERROR
           if (data.status === "error") {
             clearInterval(poll);
+            delete pollRef.current[projectId];
+
+            if (data.error_type === "RESOLUTION_MISMATCH") {
+              onError?.({
+                type: "RESOLUTION_MISMATCH",
+                message: data.message
+              });
+            }
 
             setProjects(prev =>
               prev.map(p =>
@@ -183,6 +216,8 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
                   : p
               )
             );
+
+            return;
           }
 
         } catch (err) {
@@ -190,7 +225,7 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
         }
       }, 800);
 
-      pollRef.current = poll;
+      pollRef.current[projectId] = poll;
 
     } catch (err) {
       console.error("HDR generation failed:", err);
@@ -202,6 +237,8 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
             : p
         )
       );
+
+      throw err; // 🔥 THIS is REQUIRED
     }
   };
 
