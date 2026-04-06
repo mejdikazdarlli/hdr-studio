@@ -14,7 +14,13 @@ export interface RawImage {
 export interface HDRResult {
   url: string;
   downloadUrl: string;
+
   blendUrl?: string;
+
+  // 🔥 ADD THESE
+  finalAI?: string;
+  blendAI?: string;
+
   timestamp?: number;
 }
 

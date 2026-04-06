@@ -13,7 +13,7 @@ export function ProjectList({
         <div
           key={project.id}
           onClick={() => setActiveProjectId(project.id)}
-          className={`group p-3 rounded-xl cursor-pointer ${
+          className={`group p-3 flex justify-between rounded-xl cursor-pointer ${
             activeProjectId === project.id
               ? "bg-slate-800 border border-indigo-500"
               : "hover:bg-slate-800"

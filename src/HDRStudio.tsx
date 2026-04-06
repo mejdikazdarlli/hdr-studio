@@ -125,22 +125,22 @@ export default function HDRStudio() {
   }, [serverStatus]);
 
   const handleGenerateHDR = async () => {
-  if (!activeProject) return;
+    if (!activeProject) return;
 
-  await generateHDR(
-    activeProject,
-    undefined,
-    false,
-    (err) => {
-      if (err?.type === "RESOLUTION_MISMATCH") {
-        setResolutionError({
-          message: err.message,
-          project: activeProject
-        });
+    await generateHDR(
+      activeProject,
+      undefined,
+      false,
+      (err) => {
+        if (err?.type === "RESOLUTION_MISMATCH") {
+          setResolutionError({
+            message: err.message,
+            project: activeProject
+          });
+        }
       }
-    }
-  );
-};
+    );
+  };
 
   const handleRetryConnection = async () => {
     setRetrying(true);
@@ -296,9 +296,13 @@ export default function HDRStudio() {
 
       // ✅ instant preview (fast UX)
       result: {
-        url: previewUrl,
+        url: `${API_URL}/result_preview/${jobId}`,
+        blendUrl: `${API_URL}/blend_preview/${jobId}`,
+
+        finalAI: `${API_URL}/final_ai/${jobId}`,
+        blendAI: `${API_URL}/blend_ai/${jobId}`,
+
         downloadUrl: `${API_URL}/result/${jobId}`,
-        blendUrl,
         timestamp: Date.now()
       }
     };
@@ -585,17 +589,17 @@ export default function HDRStudio() {
   }, [projects]);
 
   const handleResizeConfirm = async () => {
-  if (!resolutionError?.project) return;
+    if (!resolutionError?.project) return;
 
-  await generateHDR(
-    resolutionError.project,
-    resolutionError.project.jobId, // reuse existing job to preserve server state,
-    true, // 🔥 force resize
-    () => {}
-  );
+    await generateHDR(
+      resolutionError.project,
+      resolutionError.project.jobId, // reuse existing job to preserve server state,
+      true, // 🔥 force resize
+      () => { }
+    );
 
-  setResolutionError(null);
-};
+    setResolutionError(null);
+  };
 
   const handleResizeCancel = () => {
     setResolutionError(null);

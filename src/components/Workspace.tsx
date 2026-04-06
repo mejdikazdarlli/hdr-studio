@@ -1,5 +1,6 @@
 import { Layers, Image as ImageIcon, X, CheckCircle2 } from "lucide-react";
 import { cn } from "../utils/cn";
+import { useState } from "react";
 
 export function Workspace({
   activeProject,
@@ -11,6 +12,7 @@ export function Workspace({
   fileInputRef,
   dragActive
 }: any) {
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
   return (
     <main className="flex-1 flex flex-col h-screen overflow-hidden relative">
 
@@ -132,35 +134,35 @@ export function Workspace({
                 <button
                   onClick={() => generateHDR(activeProject)}
                   disabled={
-                    activeProject.images.length < 2 ||
+                    activeProject.images.length < 1 ||
                     activeProject.images.some((img: any) => img.uploadStatus !== "uploaded") ||
                     activeProject.status === "processing"
-                    }
+                  }
                   className="px-8 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold disabled:opacity-50"
                 >
                   {activeProject.status === "processing"
                     ? "Processing..."
                     : activeProject.status === "finalizing"
-                    ? "Preparing..."
-                    : "Generate HDR"}
+                      ? "Preparing..."
+                      : "Generate HDR"}
                 </button>
               </div>
 
               {/* PROGRESS */}
               {(activeProject.status === "processing" ||
                 activeProject.status === "finalizing") && !activeProject.result && (
-                <div className="bg-slate-900 p-4 rounded-lg">
-                  <div className="text-xs mb-2">
-                    {activeProject.progress}%
+                  <div className="bg-slate-900 p-4 rounded-lg">
+                    <div className="text-xs mb-2">
+                      {activeProject.progress}%
+                    </div>
+                    <div className="h-2 bg-slate-800 rounded">
+                      <div
+                        className="h-full bg-indigo-500"
+                        style={{ width: `${activeProject.progress}%` }}
+                      />
+                    </div>
                   </div>
-                  <div className="h-2 bg-slate-800 rounded">
-                    <div
-                      className="h-full bg-indigo-500"
-                      style={{ width: `${activeProject.progress}%` }}
-                    />
-                  </div>
-                </div>
-              )}
+                )}
             </div>
 
             {/* RIGHT SIDE (RESULT) */}
@@ -169,66 +171,110 @@ export function Workspace({
               {/* PROCESSING STATE */}
               {(activeProject.status === "processing" ||
                 activeProject.status === "finalizing") && !activeProject.result && (
-                <div className="flex-1 flex flex-col items-center justify-center text-slate-500">
-                  <div className="w-16 h-16 border-4 border-slate-700 border-t-indigo-500 rounded-full animate-spin mb-4" />
-                  <p className="text-sm">
-                    {activeProject.status === "processing"
-                      ? "Processing HDR..."
-                      : "Preparing result..."}
-                  </p>
-                </div>
-              )}
+                  <div className="flex-1 flex flex-col items-center justify-center text-slate-500">
+                    <div className="w-16 h-16 border-4 border-slate-700 border-t-indigo-500 rounded-full animate-spin mb-4" />
+                    <p className="text-sm">
+                      {activeProject.status === "processing"
+                        ? "Processing HDR..."
+                        : "Preparing result..."}
+                    </p>
+                  </div>
+                )}
 
               {/* RESULT */}
               {activeProject.status === "completed" && activeProject.result && (
-                  <div className="space-y-4">
-                    <h3 className="text-sm text-emerald-400 font-semibold flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4" />
-                      Output Result
-                    </h3>
+                <div className="space-y-4">
+                  <h3 className="text-sm text-emerald-400 font-semibold flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4" />
+                    Output Result
+                  </h3>
 
-                    <div className="grid grid-cols-2 gap-4">
+                  <div className="grid grid-cols-2 gap-4">
 
-                      {/* FINAL */}
+                    {/* FINAL */}
+                    <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
+                      <div className="aspect-[4/3] flex items-center justify-center">
+                        <img
+                          src={activeProject.result.url}
+                          className="max-w-full max-h-full object-contain cursor-pointer"
+                          loading="lazy"
+                          onClick={() => setSelectedImage(activeProject.result.url)}
+                        />
+                      </div>
+                      <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
+                        Output A
+                      </div>
+                    </div>
+
+                    {activeProject.result.finalAI && (
                       <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
                         <div className="aspect-[4/3] flex items-center justify-center">
                           <img
-                            src={activeProject.result.url}
-                            className="max-w-full max-h-full object-contain"
-                            loading="lazy"
+                            src={activeProject.result.finalAI}
+                            className="max-w-full max-h-full object-contain cursor-pointer"
+                            onClick={() => setSelectedImage(activeProject.result.finalAI)}
                           />
                         </div>
                         <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
-                          Final
+                          Output B
                         </div>
                       </div>
+                    )}
 
-                      {/* BLEND */}
-                      {activeProject.result.blendUrl && (
-                        <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
-                          <div className="aspect-[4/3] flex items-center justify-center">
-                            <img
-                              src={activeProject.result.blendUrl}
-                              className="max-w-full max-h-full object-contain"
-                              loading="lazy"
-                            />
-                          </div>
-                          <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
-                            Blend
-                          </div>
+                    {activeProject.result.blendUrl && (
+                      <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
+                        <div className="aspect-[4/3] flex items-center justify-center">
+                          <img
+                            src={activeProject.result.blendUrl}
+                            className="max-w-full max-h-full object-contain cursor-pointer"
+                            loading="lazy"
+                            onClick={() => setSelectedImage(activeProject.result.blendUrl)}
+                          />
                         </div>
-                      )}
+                        <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
+                          Output D
+                        </div>
+                      </div>
+                    )}
 
-                    </div>
-                    {/* <a
+                    {activeProject.result.blendAI && (
+                      <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-900">
+                        <div className="aspect-[4/3] flex items-center justify-center">
+                          <img
+                            src={activeProject.result.blendAI}
+                            className="max-w-full max-h-full object-contain cursor-pointer"
+                            onClick={() => setSelectedImage(activeProject.result.blendAI)}
+                          />
+                        </div>
+                        <div className="absolute bottom-2 left-2 text-xs bg-black/50 px-2 py-1 rounded">
+                          Output C
+                        </div>
+                      </div>
+                    )}
+
+
+                    {selectedImage && (
+                      <div
+                        className="fixed inset-0 bg-black/90 flex items-center justify-center z-50"
+                        onClick={() => setSelectedImage(null)}
+                      >
+                        <img
+                          src={selectedImage}
+                          className="max-w-[95%] max-h-[95%] object-contain"
+                        />
+                      </div>
+                    )}
+
+                  </div>
+                  {/* <a
                       href={activeProject.result.downloadUrl}
                       download
                       className="block text-center text-sm text-indigo-400 hover:text-white"
                     >
                       Download High-Res
                     </a> */}
-                  </div>
-                )}
+                </div>
+              )}
             </div>
           </div>
         </>

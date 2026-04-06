@@ -187,9 +187,15 @@ export function useHDR(setProjects: Dispatch<SetStateAction<Project[]>>) {
                   ...p,
                   status: "completed",
                   result: {
-                    url,
-                    downloadUrl: url,
+                    // ORIGINALS
+                    url: `${API_URL}/result_preview/${safeJobId}`,
                     blendUrl: `${API_URL}/blend_preview/${safeJobId}`,
+
+                    // AI RESULTS
+                    finalAI: `${API_URL}/final_ai/${safeJobId}`,
+                    blendAI: `${API_URL}/blend_ai/${safeJobId}`,
+
+                    downloadUrl: `${API_URL}/result/${safeJobId}`,
                     timestamp: Date.now()
                   }
                 };
