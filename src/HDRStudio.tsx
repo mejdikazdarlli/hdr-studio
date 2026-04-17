@@ -75,6 +75,17 @@ export default function HDRStudio() {
     setImageLoaded(false);
   }, [activeProjectId]); // 🔥 only when switching project
 
+  // Helper to load images with ngrok header and convert to blob URL
+  const loadImageWithHeaders = async (url: string): Promise<string> => {
+    const response = await fetch(url, {
+      headers: { "ngrok-skip-browser-warning": "true" }
+    });
+
+    if (!response.ok) throw new Error("Failed to load image");
+
+    const blob = await response.blob();
+    return URL.createObjectURL(blob);
+  };
 
   useEffect(() => {
     let interval: any;
@@ -175,25 +186,42 @@ export default function HDRStudio() {
 
       const files = await res.json();
 
+      // Load all images with headers
+      const imagePromises = files.map(async (name: string) => {
+        const url = `${API_URL}/preview/${serverProjectId}/${name}`;
+        try {
+          const blobUrl = await loadImageWithHeaders(url);
+          return {
+            id: crypto.randomUUID(),
+            previewUrl: blobUrl,
+            name,
+            uploadProgress: 100,
+            uploadStatus: "uploaded"
+          };
+        } catch {
+          // Fallback to direct URL
+          return {
+            id: crypto.randomUUID(),
+            previewUrl: `${url}?t=${Date.now()}`,
+            name,
+            uploadProgress: 100,
+            uploadStatus: "uploaded"
+          };
+        }
+      });
+
+      const images = await Promise.all(imagePromises);
+
       setProjects(prev =>
         prev.map(p =>
           p.id === projectId
-            ? {
-              ...p,
-              images: files.map((name: string) => ({
-                id: crypto.randomUUID(),
-                previewUrl: `${API_URL}/preview/${serverProjectId}/${name}?t=${Date.now()}`,
-                name,
-                uploadProgress: 100,
-                uploadStatus: "uploaded"
-              }))
-            }
+            ? { ...p, images }
             : p
         )
       );
 
     } catch (e) {
-      console.error("preview load failed");
+      console.error("preview load failed", e);
     }
   };
 
@@ -344,15 +372,22 @@ export default function HDRStudio() {
 
   const handleDeleteProject = (id: string) => {
     const project = projects.find(p => p.id === id);
-
     if (project) {
-      project.images.forEach(img => URL.revokeObjectURL(img.previewUrl));
-      if (project.result && project.jobId) {
-        URL.revokeObjectURL(project.result.url);
+      project.images.forEach(img => {
+        // Revoke ALL preview URLs (blob or direct)
+        try {
+          URL.revokeObjectURL(img.previewUrl);
+        } catch { }
+      });
+      if (project.result && project.result.url) {
+        try {
+          URL.revokeObjectURL(project.result.url);
+        } catch { }
       }
     }
 
     deleteProject(id);
+
 
     setActiveProjectId(prev => {
       if (prev !== id) return prev;
@@ -439,30 +474,58 @@ export default function HDRStudio() {
         }
 
         const res = JSON.parse(xhr.responseText);
+        const serverPreviewUrl = `${API_URL}${res.preview_url}`;
 
-        setProjects(prev =>
-          prev.map(p =>
-            p.id === projectId
-              ? {
-                ...p,
-                images: p.images.map(img =>
-                  img.id === imageId
-                    ? {
-                      ...img,
-                      previewUrl: `${API_URL}${res.preview_url}`,
-                      storedName: res.stored_name,
-                      uploadProgress: 100,
-                      uploadStatus: "uploaded"
-                    }
-                    : img
-                )
-              }
-              : p
-          )
-        );
-
-        resolve();
-      };
+        // Load image with headers and convert to blob URL
+        loadImageWithHeaders(serverPreviewUrl)
+          .then(blobUrl => {
+            setProjects(prev =>
+              prev.map(p =>
+                p.id === projectId
+                  ? {
+                    ...p,
+                    images: p.images.map(img =>
+                      img.id === imageId
+                        ? {
+                          ...img,
+                          previewUrl: blobUrl, // ✅ Use blob URL
+                          storedName: res.stored_name,
+                          uploadProgress: 100,
+                          uploadStatus: "uploaded"
+                        }
+                        : img
+                    )
+                  }
+                  : p
+              )
+            );
+            resolve();
+          })
+          .catch(() => {
+            // Fallback to direct URL
+            setProjects(prev =>
+              prev.map(p =>
+                p.id === projectId
+                  ? {
+                    ...p,
+                    images: p.images.map(img =>
+                      img.id === imageId
+                        ? {
+                          ...img,
+                          previewUrl: serverPreviewUrl,
+                          storedName: res.stored_name,
+                          uploadProgress: 100,
+                          uploadStatus: "uploaded"
+                        }
+                        : img
+                    )
+                  }
+                  : p
+              )
+            );
+            resolve();
+          });
+      };;
 
       xhr.onerror = reject;
 
@@ -481,8 +544,8 @@ export default function HDRStudio() {
 
         const imageToRemove = p.images.find(img => img.id === imageId);
 
-        // Clean up blob preview URLs only
-        if (imageToRemove && imageToRemove.previewUrl.startsWith("blob:")) {
+        // Clean up ALL object URLs (blob: or regular)
+        if (imageToRemove?.previewUrl) {
           URL.revokeObjectURL(imageToRemove.previewUrl);
         }
 
